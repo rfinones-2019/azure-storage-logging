@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Modified by Rodel rfinones@microsoft.com:
+# Update to support azure-storage-blob/azure-storage-queue using python SDK V12
+
 import logging
 import os
 import string
@@ -22,10 +26,10 @@ from socket import gethostname
 from tempfile import mkstemp
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from azure.storage.blob import BlockBlobService
-from azure.storage.blob.models import ContentSettings
-from azure.storage.queue import QueueService
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.storage.queue import QueueServiceClient
 from azure.storage.table import TableBatch, TableService
+from azure.core.exceptions import ResourceExistsError
 
 _PY3 = sys.version_info[0] == 3
 
@@ -50,8 +54,8 @@ class _BlobStorageFileHandler(object):
                   max_retries=5,
                   retry_wait=1.0,
                   is_emulated=False):
-        self.service = BlockBlobService(account_name=account_name,
-                                        account_key=account_key,
+        self.service = BlobServiceClient(account_url=f'https://{account_name}.blob.core.windows.net',
+                                        credential=account_key,
                                         is_emulated=is_emulated,
                                         protocol=protocol)
         self.container_created = False
@@ -69,8 +73,12 @@ class _BlobStorageFileHandler(object):
         """
         Ship the outdated log file to the specified blob container.
         """
+        container_client = self.service.get_container_client(self.container)
         if not self.container_created:
-            self.service.create_container(self.container)
+            try:
+                container_client.create_container()
+            except ResourceExistsError:
+                pass
             self.container_created = True
         fd, tmpfile_path = None, ''
         try:
@@ -84,12 +92,13 @@ class _BlobStorageFileHandler(object):
                 file_path = tmpfile_path
             else:
                 suffix, content_type = '', 'text/plain'
-            self.service.create_blob_from_path(container_name=self.container,
-                                               blob_name=fileName+suffix,
-                                               file_path=file_path,
-                                               content_settings=ContentSettings(content_type=content_type),
-                                               max_connections=self.max_connections
-                                               )  # max_retries and retry_wait no longer arguments in azure 0.33
+
+            # get blob client and write the data
+            blob_client = container_client.get_blob_client(fileName+suffix)
+            with open(file_path, 'rb') as data:
+                blob_client.upload_blob(data,
+                                        overwrite=True,
+                                        content_settings=ContentSettings(content_type=content_type))
         finally:
             if self.zip_compression and fd:
                 os.remove(tmpfile_path)
@@ -233,7 +242,7 @@ class QueueStorageHandler(logging.Handler):
     """
     Handler class which sends log messages to a Azure Storage queue.
     """
-    def __init__(self, 
+    def __init__(self,
                  account_name=None,
                  account_key=None,
                  protocol='https',
@@ -247,10 +256,10 @@ class QueueStorageHandler(logging.Handler):
         Initialize the handler.
         """
         logging.Handler.__init__(self)
-        self.service = QueueService(account_name=account_name,
-                                    account_key=account_key,
-                                    is_emulated=is_emulated,
-                                    protocol=protocol)
+        self.service = QueueServiceClient(account_url=f'https://{account_name}.queue.core.windows.net',
+                                        credential=account_key,
+                                        is_emulated=is_emulated,
+                                        protocol=protocol)
         self.meta = {'hostname': gethostname(), 'process': os.getpid()}
         self.queue = _formatName(queue, self.meta)
         self.queue_created = False
@@ -266,14 +275,15 @@ class QueueStorageHandler(logging.Handler):
         """
         try:
             if not self.queue_created:
-                self.service.create_queue(self.queue)
+                queue_client = self.service.create_queue(self.queue)
                 self.queue_created = True
+            else:
+                queue_client = self.service.get_queue_client(self.queue)
             record.hostname = self.meta['hostname']
             msg = self._encode_text(self.format(record))
-            self.service.put_message(self.queue,
-                                     msg,
-                                     self.visibility_timeout,
-                                     self.message_ttl)
+            queue_client.send_message(msg,
+                                      visibility_timeout=self.visibility_timeout,
+                                      time_to_live=self.message_ttl)
         except (KeyboardInterrupt, SystemExit):
             raise
         except:
